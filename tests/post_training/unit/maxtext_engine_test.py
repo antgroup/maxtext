@@ -250,9 +250,14 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
     self.assertEqual(recorded.shape, (1,), "one norm per update, not one per micro-batch")
     np.testing.assert_allclose(recorded[0], np.sqrt(2 * 0.25**2), rtol=1e-5)
 
+  @mock.patch("orbax.checkpoint.PyTreeCheckpointHandler")
   @mock.patch("orbax.checkpoint.CheckpointManager")
-  def test_max_text_trainer_checkpoint_manager_init(self, mock_create_mgr):
-    mock_config = self.setup_config(enable_checkpointing=True)
+  def test_max_text_trainer_checkpoint_manager_init(self, mock_create_mgr, mock_handler):
+    mock_config = self.setup_config(
+        enable_checkpointing=True,
+        checkpoint_storage_use_ocdbt=False,
+        checkpoint_storage_use_zarr3=False,
+    )
 
     _ = maxtext_engine.MaxTextTrainingEngine(mock_config)
     mock_create_mgr.assert_called_once_with(
@@ -262,6 +267,16 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
             max_to_keep=mock_config.max_num_checkpoints_to_keep,
             enable_async_checkpointing=mock_config.async_checkpointing,
         ),
+        item_handlers={
+            "model_params": mock_handler.return_value,
+            "optimizer_state": mock_handler.return_value,
+            "accumulated_metrics": mock_handler.return_value,
+            "accumulated_grads": mock_handler.return_value,
+        },
+    )
+    self.assertEqual(mock_handler.call_count, 4)
+    mock_handler.assert_has_calls(
+        [mock.call(use_ocdbt=False, use_zarr3=False)] * 4,
     )
 
   def test_save_checkpoint_called_after_update(self):
@@ -1002,6 +1017,7 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
     self.assertIs(abstract_engine.LossOutput, sft_utils.LossOutput)
     self.assertIs(abstract_engine.WeightedMetric, sft_utils.WeightedMetric)
     self.assertIs(abstract_engine.TrainerPayload, datatypes.TrainerPayload)
+    self.assertIs(abstract_engine.RLTrainerPayload, datatypes.RLTrainerPayload)
 
     tunix_metric = sft_utils.WeightedMetric(unreduced_sum=jnp.array(4.0), denominator=jnp.array(2.0))
     self.assertIsInstance(tunix_metric, abstract_engine.WeightedMetric)
@@ -1014,12 +1030,14 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
 
     # What actually arrives at fwd_bwd from GRPOAdapter.create_trainer_payloads.
     rl_payload = datatypes.RLTrainerPayload(
-        token_ids=jnp.zeros((1, 4)),
-        token_mask=jnp.ones((1, 4)),
+        prompt_ids=jnp.zeros((1, 4)),
+        prompt_mask=jnp.ones((1, 4)),
+        completion_ids=jnp.zeros((1, 4)),
+        completion_mask=jnp.ones((1, 4)),
         advantages=jnp.zeros((1,)),
-        loss_mask=jnp.ones((1, 4)),
     )
     self.assertIsInstance(rl_payload, abstract_engine.TrainerPayload)
+    self.assertIsInstance(rl_payload, abstract_engine.RLTrainerPayload)
 
   def test_unsupported_loss_return_raises_naming_the_type(self):
     """An unrecognised return fails loudly and says what it received."""
@@ -1066,13 +1084,8 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
     self.assertIn("loss", buf.weighted_metrics)
     self.assertNotIn("loss", buf.scalar_metrics)
 
-  def test_eval_step_warns_once_and_mutates_no_state(self):
-    """eval_step is an unimplemented no-op, but an audible one, and it disturbs nothing.
-
-    `AbstractTrainer.eval_step` forbids mutating trainer state, so this asserts against a
-    populated engine -- gradients accumulated and a micro step counted -- rather than a
-    fresh one, where "unchanged" would be trivially true.
-    """
+  def test_eval_step_records_eval_metrics_and_mutates_no_training_state(self):
+    """eval_step scores a batch without disturbing training, and its metrics stay separate."""
     t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
     t.with_loss_fn(
         lambda *args, **kwargs: (
@@ -1086,18 +1099,41 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
     micro_steps_before = t._micro_step_count
     train_step_before = t.train_step
     self.assertEqual(micro_steps_before, 1)
+    train_entries_before = t._metrics_recorder.get_step_metrics(train_step_before).weighted_metrics["loss"]
+    train_entries_before = train_entries_before.unreduced_sum.size
 
-    with self.assertLogs(level="WARNING") as logs:
-      t.eval_step(DummyPayload())
-      t.eval_step(DummyPayload())
-      t.eval_step(DummyPayload())
+    with mock.patch.object(t._metrics_logger, "write_metrics") as write_metrics:
+      with t.eval_context():
+        t.eval_step(DummyPayload())
+        t.eval_step(DummyPayload())
+        t.eval_step(DummyPayload())
 
-    eval_warnings = [line for line in logs.output if "eval_step is not implemented" in line]
-    self.assertLen(eval_warnings, 1)
-
+    # Nothing about the in-flight training step moved.
     self.assertEqual(t._micro_step_count, micro_steps_before)
     self.assertEqual(t.train_step, train_step_before)
     jax.tree.map(np.testing.assert_array_equal, grads_before, t._accumulated_grads)
+
+    # The train buffer still holds exactly the one fwd_bwd loss: no eval leaked into it.
+    train_buf = t._metrics_recorder.get_step_metrics(train_step_before)
+    self.assertEqual(train_buf.weighted_metrics["loss"].unreduced_sum.size, train_entries_before)
+    self.assertEqual(train_buf.mode, metrics_module.Mode.TRAIN)
+
+    # Leaving the context writes the pass once, tagged eval, against the step it ran at --
+    # not once per micro-batch, which would put three points on the curve at one x.
+    self.assertEqual(write_metrics.call_count, 1)
+    eval_buf = write_metrics.call_args.args[0]
+    self.assertEqual(write_metrics.call_args.kwargs["mode"], metrics_module.Mode.EVAL)
+    self.assertEqual(eval_buf.mode, metrics_module.Mode.EVAL)
+    self.assertEqual(eval_buf.id, train_step_before)
+
+    # All three micro-batches accumulated into that one buffer. `compute()` is elementwise,
+    # so it stays per-micro-batch here; `process_metrics` is what averages it down.
+    eval_loss = eval_buf.weighted_metrics["loss"]
+    self.assertEqual(eval_loss.unreduced_sum.size, 3)
+    self.assertAlmostEqual(float(np.mean(np.asarray(eval_loss.compute()))), 0.5, places=4)
+
+    # The recorder is drained, so a later pass cannot re-write this one's numbers.
+    self.assertEmpty(t._eval_metrics_recorder.get_metrics_history(clear_cache=False))
 
   def test_get_metrics_returns_one_buffer_and_a_sentinel_when_empty(self):
     """`get_metrics` returns a single buffer, matching both ABCs.
@@ -1330,6 +1366,54 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
     self.assertAlmostEqual(processed["loss"], 6.0, places=4)
     self.assertIn("perplexity", processed)
     self.assertAlmostEqual(processed["perplexity"], float(np.exp(6.0)), places=3)
+
+  def test_prepare_weight_sync_rejects_an_unknown_transport(self):
+    """An unrecognised transport must name itself rather than return empty metadata."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    with self.assertRaisesRegex(ValueError, "raidan"):
+      t.prepare_weight_sync(staging_transport="raidan")
+
+  def _sharded_batch_spec(self, engine, axis="data"):
+    """A data sharding whose batch dim is actually sharded.
+
+    The single-device test mesh makes `get_input_data_sharding` return a spec with `None`
+    in the batch position, so the replication branch is unreachable as configured -- an
+    earlier version of these tests asserted `spec[0] is None` and passed without ever
+    running the code under test. Stub a spec that shards the batch dim instead.
+    """
+    return jax.sharding.NamedSharding(engine._mesh, jax.sharding.PartitionSpec(axis, None))  # pylint: disable=protected-access
+
+  def test_indivisible_batch_dim_replicates_and_warns_once(self):
+    """Replicating the batch dim is an N-fold compute cliff, so it must be audible."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    batch = {"a": jnp.zeros((1, 4)), "b": jnp.zeros((1, 4))}
+
+    # Batch dim 1 against a 2-wide axis: indivisible, so the dim must be replicated.
+    with mock.patch.object(maxtext_engine.sharding, "get_input_data_sharding", return_value=self._sharded_batch_spec(t)):
+      with mock.patch.object(type(t), "_batch_axis_size", return_value=2):
+        with self.assertLogs(level="WARNING") as logs:
+          shardings = t._batch_data_shardings(batch)  # pylint: disable=protected-access
+          t._batch_data_shardings(batch)  # pylint: disable=protected-access
+
+    for name, leaf_sharding in shardings.items():
+      self.assertIsNone(leaf_sharding.spec[0], f"{name} should have its batch dim replicated")
+
+    # Once per instance, not per leaf and not per call: two leaves over two calls is four
+    # chances to warn.
+    warnings = [line for line in logs.output if "does not divide mesh axis" in line]
+    self.assertLen(warnings, 1)
+    self.assertIn("2x the work", warnings[0])
+
+  def test_divisible_batch_dim_stays_sharded_and_is_silent(self):
+    """The normal case must neither replicate nor warn."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+
+    with mock.patch.object(maxtext_engine.sharding, "get_input_data_sharding", return_value=self._sharded_batch_spec(t)):
+      with mock.patch.object(type(t), "_batch_axis_size", return_value=2):
+        shardings = t._batch_data_shardings({"a": jnp.zeros((4, 4))})  # pylint: disable=protected-access
+
+    self.assertEqual(shardings["a"].spec[0], "data")
+    self.assertFalse(t._replicated_batch_warned)  # pylint: disable=protected-access
 
 
 if __name__ == "__main__":
