@@ -34,8 +34,6 @@ from flax import nnx
 import jax
 from maxtext.configs import pyconfig
 from maxtext.utils.globals import MAXTEXT_PKG_DIR
-from maxtext.layers import quantizations
-from maxtext.models import models
 from maxtext.utils import maxtext_utils, model_creation_utils
 from optax.contrib._muon import MuonDimensionNumbers as mdn
 
@@ -94,10 +92,15 @@ MOE_BLOCK_NAMES = (
     "moe_block",
     "routed_experts",
     "GptOssMlp",
+    "routed_moe",
 )
 
 
-def transform_logic(path: Tuple[str, ...], shape: Optional[Tuple[int, ...]] = None) -> Optional[mdn]:
+def transform_logic(
+    path: Tuple[str, ...],
+    shape: Optional[Tuple[int, ...]] = None,
+    include_routers: bool = True,
+) -> Optional[mdn]:
   """Determines Muon dimension numbers based on parameter path and shape.
 
   This function maps a parameter's hierarchical path within the model
@@ -130,6 +133,8 @@ def transform_logic(path: Tuple[str, ...], shape: Optional[Tuple[int, ...]] = No
   Args:
     path: Tuple of strings representing the parameter's hierarchical path.
     shape: Optional shape tuple of the parameter tensor.
+    include_routers: Whether to apply Muon updates to MoE router matrices. If
+      False, router weights return None and are optimized with AdamW.
 
   Returns:
     An instance of `optax.contrib.MuonDimensionNumbers` if a valid mapping is
@@ -149,9 +154,12 @@ def transform_logic(path: Tuple[str, ...], shape: Optional[Tuple[int, ...]] = No
     return None
 
   # MoE routed expert weights: [num_experts, (num_layers), in_features, out_features]
-  if _is_path_contain_any(MOE_BLOCK_NAMES, path):
+  if _is_path_contain_any(MOE_BLOCK_NAMES, path) and not _is_path_contain_any(("shared_experts", "shared_expert"), path):
     if _is_path_contain_any(("wi", "wi_0", "wi_1", "wo", "gate_up_proj"), path):
       return mdn((-2,), (-1,))
+    # MoE router weights (e.g. gate.kernel): [in_features, (num_layers), num_experts]
+    if _is_path_contain_any(("gate", "router"), path):
+      return mdn((0,), (-1,)) if include_routers else None
 
   # Block-diagonal grouped linear layer (e.g. DeepSeek-V4 attention output projection):
   # [n_groups, (num_layers), in_features_per_group, out_features_per_group] -> reduce (-2,), output (-1,)
@@ -175,40 +183,32 @@ def transform_logic(path: Tuple[str, ...], shape: Optional[Tuple[int, ...]] = No
   return mdn((0,), (-1,))
 
 
-def get_transform_tree(tree, path=()):
+def get_transform_tree(tree, path=(), include_routers: bool = True):
   """Recursively extracts `MuonDimensionNumbers` for Linen abstract parameters."""
   if isinstance(tree, (dict, collections.abc.Mapping)) or hasattr(tree, "items"):
-    return {k: get_transform_tree(v, path=path + (k,)) for k, v in tree.items()}
+    return {k: get_transform_tree(v, path=path + (k,), include_routers=include_routers) for k, v in tree.items()}
   else:
     val = getattr(tree, "value", tree)
     val_shape = getattr(val, "shape", None)
-    return transform_logic(path, shape=val_shape)
+    return transform_logic(path, shape=val_shape, include_routers=include_routers)
 
 
 def get_muon_weight_dimension_numbers(model, config=None, verbose=False):
   """Extracts a matching pytree of `MuonDimensionNumbers` from a model."""
-  if isinstance(model, nnx.Module):
-    _, abstract_param, _ = nnx.split(model, nnx.Param, ...)
+  include_routers = getattr(config, "muon_include_routers", True) if config is not None else True
+  _, abstract_param, _ = nnx.split(model, nnx.Param, ...)
 
-    def apply_transform_nnx(path: Tuple[jax.tree_util.KeyEntry, ...], leaf):
-      # Convert jax.tree_util.KeyEntry path to Tuple[str, ...]
-      path_strings = tuple(p.key for p in path if isinstance(p, jax.tree_util.DictKey))
-      val = leaf.get_value() if hasattr(leaf, "get_value") else leaf
-      val_shape = getattr(val, "shape", None)
-      return transform_logic(path_strings, shape=val_shape)
+  def apply_transform_nnx(path: Tuple[jax.tree_util.KeyEntry, ...], leaf):
+    # Convert jax.tree_util.KeyEntry path to Tuple[str, ...]
+    path_strings = tuple(p.key for p in path if isinstance(p, jax.tree_util.DictKey))
+    val = leaf.get_value() if hasattr(leaf, "get_value") else leaf
+    val_shape = getattr(val, "shape", None)
+    return transform_logic(path_strings, shape=val_shape, include_routers=include_routers)
 
-    # NNX abstract_param is an nnx.State (not Linen's dict of LogicallyPartitioned leaves);
-    # tree_map_with_path round-trips that structure so each Param.value holds the mdn result.
-    muon_weight_dimension_numbers = jax.tree_util.tree_map_with_path(
-        apply_transform_nnx, nnx.to_pure_dict(abstract_param)
-    )
-    muon_weight_dimension_numbers = nnx.State(muon_weight_dimension_numbers)
-
-  else:  # Linen
-    # quickly get param structure without materialization
-    abstract_param = maxtext_utils.get_abstract_param(model, config)
-    # get muon dimension number from param
-    muon_weight_dimension_numbers = get_transform_tree(abstract_param)
+  # tree_map_with_path handles NNX's PyTree structure; result is an nnx.State with the
+  # same structure, where each Param's value holds the mdn result.
+  muon_weight_dimension_numbers = jax.tree_util.tree_map_with_path(apply_transform_nnx, nnx.to_pure_dict(abstract_param))
+  muon_weight_dimension_numbers = nnx.State(muon_weight_dimension_numbers)
 
   if verbose:
     _print_structure_debug(abstract_param, muon_weight_dimension_numbers)
@@ -240,7 +240,7 @@ def _print_structure_debug(abstract_param, muon_weight_dimension_numbers):
   print("\nIs this reasonable?")
 
 
-def get_model_mdn(model_name, scan_layers=True, verbose=False, pure_nnx=False):
+def get_model_mdn(model_name, scan_layers=True, verbose=False, include_routers=True):
   """Initializes a model and retrieves its Muon dimension numbers.
 
   This function sets up the configuration for a given model, initializes the
@@ -252,6 +252,7 @@ def get_model_mdn(model_name, scan_layers=True, verbose=False, pure_nnx=False):
     scan_layers: Whether to use layer scanning in the model configuration.
     verbose: If True, prints detailed debugging information about the model
       structure and Muon dimension numbers.
+    include_routers: Whether to apply Muon updates to MoE router matrices.
 
   Returns:
     A tree structure containing the Muon dimension numbers for the model's
@@ -264,36 +265,24 @@ def get_model_mdn(model_name, scan_layers=True, verbose=False, pure_nnx=False):
       f"model_name={model_name}",
       f"scan_layers={scan_layers}",
       "attention=dot_product",
-      f"pure_nnx={pure_nnx}",
+      f"muon_include_routers={include_routers}",
       "skip_jax_distributed_system=True",
   ]
-  if not pure_nnx:
-    argv.extend(
-        [
-            "enable_nnx=False",
-            "pure_nnx_decoder=False",
-        ]
-    )
   config = pyconfig.initialize(argv)
   # Setup model
   devices_array = maxtext_utils.create_device_mesh(config)
   mesh = jax.sharding.Mesh(devices_array, config.mesh_axes)
-  quant = quantizations.configure_quantization(config)
-  if pure_nnx:
-    _, model = model_creation_utils.create_nnx_abstract_model(config, mesh)
-  else:
-    model = models.transformer_as_linen(config, mesh=mesh, quant=quant)
+  _, model = model_creation_utils.create_nnx_abstract_model(config, mesh)
   # Get dimension number
   muon_weight_dimension_numbers = get_muon_weight_dimension_numbers(model, config, verbose=verbose)
-  if pure_nnx:
-    muon_weight_dimension_numbers = {"params": nnx.to_pure_dict(muon_weight_dimension_numbers)}
-  return muon_weight_dimension_numbers
+  return {"params": nnx.to_pure_dict(muon_weight_dimension_numbers)}
 
 
 if __name__ == "__main__":
-  if len(sys.argv) != 3:
-    print("Usage: python3 -m maxtext.utils.muon_utils <model_name> <scan_layers:True/False>")
+  if len(sys.argv) not in (3, 4):
+    print("Usage: python3 -m maxtext.utils.muon_utils <model_name> <scan_layers:True/False> [include_routers:True/False]")
     sys.exit(1)
   model_name_arg = sys.argv[1]
   scan_layers_arg = sys.argv[2].lower() == "true"
-  get_model_mdn(model_name_arg, scan_layers_arg, verbose=True, pure_nnx=False)
+  include_routers_arg = sys.argv[3].lower() == "true" if len(sys.argv) == 4 else True
+  get_model_mdn(model_name_arg, scan_layers_arg, verbose=True, include_routers=include_routers_arg)

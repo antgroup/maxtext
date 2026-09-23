@@ -29,6 +29,7 @@ from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.common.common_types import (
+    AttentionType,
     Config,
     DecoderBlockType,
     MODEL_MODE_AUTOREGRESSIVE,
@@ -38,7 +39,7 @@ from maxtext.common.common_types import (
     ShardMode,
 )
 from maxtext.configs.types import check_forced_routing_support
-from maxtext.layers import initializers, linears, mhc, moe, normalizations, quantizations
+from maxtext.layers import attention_kda, linears, mhc, moe, normalizations, quantizations
 from maxtext.layers import nnx_scan, nnx_wrappers
 from maxtext.layers.attentions import Attention
 from maxtext.layers.embeddings import Embed, PositionalEmbedding, attend_on_embedding
@@ -90,6 +91,8 @@ class NNXDecoderLayer(nnx.Module):
       model_mode: str,
       quant: None | Quant = None,
       name: str = "decoder_layer",
+      attention_type: AttentionType | str | None = None,
+      layer_idx: int = 0,
       *,
       rngs: nnx.Rngs,
   ):
@@ -97,8 +100,15 @@ class NNXDecoderLayer(nnx.Module):
     self.mesh = mesh
     self.model_mode = model_mode
     self.quant = quant
+    self.layer_idx = layer_idx
 
     cfg = self.config
+
+    # Per-layer attention type override (hybrid models); defaults to the
+    # global config value.
+    self.attention_type = (
+        AttentionType(attention_type) if attention_type is not None else AttentionType(cfg.attention_type)
+    )
 
     self.pre_self_attention_norm = RMSNorm(
         num_features=cfg.emb_dim,
@@ -109,34 +119,45 @@ class NNXDecoderLayer(nnx.Module):
         rngs=rngs,
     )
 
-    self.self_attention = Attention(
-        config=self.config,
-        num_query_heads=cfg.num_query_heads,
-        num_kv_heads=cfg.num_kv_heads,
-        head_dim=cfg.head_dim,
-        max_target_length=cfg.max_target_length,
-        max_prefill_predict_length=cfg.max_prefill_predict_length,
-        attention_kernel=cfg.attention,
-        inputs_q_shape=(1, 1, cfg.emb_dim),
-        inputs_kv_shape=(1, 1, cfg.emb_dim),
-        mesh=mesh,
-        dtype=cfg.dtype,
-        weight_dtype=cfg.weight_dtype,
-        dropout_rate=cfg.dropout_rate,
-        float32_qk_product=cfg.float32_qk_product,
-        float32_logits=cfg.float32_logits,
-        quant=self.quant,
-        kv_quant=quantizations.configure_kv_quant(cfg),
-        prefill_cache_axis_order=tuple(map(int, cfg.prefill_cache_axis_order.split(","))),
-        ar_cache_axis_order=tuple(map(int, cfg.ar_cache_axis_order.split(","))),
-        compute_axis_order=tuple(map(int, cfg.compute_axis_order.split(","))),
-        reshape_q=cfg.reshape_q,
-        use_mrope=cfg.use_mrope,
-        mrope_section=cfg.mrope_section,
-        share_kv_projections=cfg.share_kv_projections,
-        model_mode=model_mode,
-        rngs=rngs,
-    )
+    if self.attention_type == AttentionType.KDA:
+      # KDA is a self-contained recurrent attention layer (its own QKV/conv/
+      # gate/beta stack + tokamax Delta-Rule kernel); it carries recurrent
+      # state instead of a KV cache.
+      self.self_attention = attention_kda.KimiDeltaAttention(
+          config=self.config,
+          layer_idx=layer_idx,
+          mesh=mesh,
+          rngs=rngs,
+      )
+    else:
+      self.self_attention = Attention(
+          config=self.config,
+          num_query_heads=cfg.num_query_heads,
+          num_kv_heads=cfg.num_kv_heads,
+          head_dim=cfg.head_dim,
+          max_target_length=cfg.max_target_length,
+          max_prefill_predict_length=cfg.max_prefill_predict_length,
+          attention_kernel=cfg.attention,
+          inputs_q_shape=(1, 1, cfg.emb_dim),
+          inputs_kv_shape=(1, 1, cfg.emb_dim),
+          mesh=mesh,
+          dtype=cfg.dtype,
+          weight_dtype=cfg.weight_dtype,
+          dropout_rate=cfg.dropout_rate,
+          float32_qk_product=cfg.float32_qk_product,
+          float32_logits=cfg.float32_logits,
+          quant=self.quant,
+          kv_quant=quantizations.configure_kv_quant(cfg),
+          prefill_cache_axis_order=tuple(map(int, cfg.prefill_cache_axis_order.split(","))),
+          ar_cache_axis_order=tuple(map(int, cfg.ar_cache_axis_order.split(","))),
+          compute_axis_order=tuple(map(int, cfg.compute_axis_order.split(","))),
+          reshape_q=cfg.reshape_q,
+          use_mrope=cfg.use_mrope,
+          mrope_section=cfg.mrope_section,
+          share_kv_projections=cfg.share_kv_projections,
+          model_mode=model_mode,
+          rngs=rngs,
+      )
 
     self.mlp = linears.MlpBlock(
         in_features=cfg.emb_dim,
@@ -194,16 +215,27 @@ class NNXDecoderLayer(nnx.Module):
     lnx = self.pre_self_attention_norm(inputs)
     lnx = _maybe_shard_with_logical(lnx, logical_axis_names)
 
-    attention_lnx, kv_cache = self.self_attention(
-        lnx,
-        lnx,
-        decoder_positions,
-        decoder_segment_ids=decoder_segment_ids,
-        deterministic=deterministic,
-        model_mode=model_mode,
-        kv_cache=kv_cache,
-        attention_metadata=attention_metadata,
-    )
+    if self.attention_type == AttentionType.KDA:
+      # KDA has no KV cache; its recurrent state is carried by the kernel.
+      attention_lnx, _ = self.self_attention(
+          lnx,
+          decoder_positions,
+          deterministic=deterministic,
+          model_mode=model_mode,
+          decoder_segment_ids=decoder_segment_ids,
+      )
+      kv_cache = None
+    else:
+      attention_lnx, kv_cache = self.self_attention(
+          lnx,
+          lnx,
+          decoder_positions,
+          decoder_segment_ids=decoder_segment_ids,
+          deterministic=deterministic,
+          model_mode=model_mode,
+          kv_cache=kv_cache,
+          attention_metadata=attention_metadata,
+      )
     attention_lnx = _maybe_shard_with_logical(attention_lnx, logical_axis_names)
 
     mlp_lnx = self.mlp(lnx, deterministic=deterministic)
@@ -573,7 +605,7 @@ class NNXDecoder(nnx.Module):
         self.layers_outside_pipeline = self._create_scanned_layers(
             base_cls,
             length=remaining_layers,
-            metadata_axis_name="layers",
+            metadata_axis_name="layers_outside_pipeline",
             rngs=rngs,
         )
       else:
@@ -878,6 +910,11 @@ class NNXDecoder(nnx.Module):
         layer_kwargs = {"attention_type": gpt_oss.get_attention_type(layer_id=lyr)}
       elif config.decoder_block == DecoderBlockType.OLMO3:
         layer_kwargs = {"attention_type": olmo3.get_attention_type(layer_id=lyr)}
+
+      if AttentionType(config.attention_type) == AttentionType.KDA:
+        # KimiDeltaAttention records which layer of the stack it is; forward the
+        # real index rather than leaving every KDA layer tagged 0.
+        layer_kwargs["layer_idx"] = lyr
 
       self._create_and_register_layer(layer_cls, rngs, "layers", lyr, **layer_kwargs)
 
@@ -1268,14 +1305,15 @@ class NNXDecoder(nnx.Module):
     """Get remat policy for jax.checkpoint."""
     policy = None
     cfg = self.config
-    if cfg.remat_policy and cfg.remat_policy != "none":
-      if cfg.remat_policy in {"minimal_with_context", "minimal_flash"}:
-        if cfg.remat_policy == "minimal_flash":
+    remat_policy = getattr(self, "remat_policy_override", None) or cfg.remat_policy
+    if remat_policy and remat_policy != "none":
+      if remat_policy in {"minimal_with_context", "minimal_flash"}:
+        if remat_policy == "minimal_flash":
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
         policy = self.minimal_policy(with_context=True)
-      elif cfg.remat_policy == "minimal":
+      elif remat_policy == "minimal":
         policy = self.minimal_policy()
-      elif cfg.remat_policy == "minimal_with_quantization":
+      elif remat_policy == "minimal_with_quantization":
         if cfg.scan_layers:
           warnings.warn(
               "Scan layers can introduce overhead to checkpointed values that in some configurations is slower"
@@ -1284,7 +1322,7 @@ class NNXDecoder(nnx.Module):
               "beneficial for performance."
           )
         policy = self.minimal_policy(with_context=False, with_quantization=True)
-      elif cfg.remat_policy == "minimal_with_context_and_quantization":
+      elif remat_policy == "minimal_with_context_and_quantization":
         if cfg.scan_layers:
           warnings.warn(
               "Scan layers can introduce overhead to checkpointed values that in some configurations is slower"
@@ -1293,7 +1331,7 @@ class NNXDecoder(nnx.Module):
               "beneficial for performance."
           )
         policy = self.minimal_policy(with_context=True, with_quantization=True)
-      elif cfg.remat_policy == "save_dot_with_context_except_mlp":
+      elif remat_policy == "save_dot_with_context_except_mlp":
         policy = jax.checkpoint_policies.save_only_these_names(
             "query_proj",
             "value_proj",
@@ -1303,7 +1341,7 @@ class NNXDecoder(nnx.Module):
             "context",
             "out_proj",
         )
-      elif cfg.remat_policy == "save_dot_except_mlpwi":
+      elif remat_policy == "save_dot_except_mlpwi":
         policy = jax.checkpoint_policies.save_only_these_names(
             "query_proj",
             "value_proj",
@@ -1313,7 +1351,7 @@ class NNXDecoder(nnx.Module):
             "out_proj",
             "mlpwo",
         )
-      elif cfg.remat_policy == "save_dot_except_mlp":
+      elif remat_policy == "save_dot_except_mlp":
         policy = jax.checkpoint_policies.save_only_these_names(
             "query_proj",
             "value_proj",
@@ -1322,7 +1360,7 @@ class NNXDecoder(nnx.Module):
             "qkv_proj",
             "out_proj",
         )
-      elif cfg.remat_policy == "save_qkv_proj":
+      elif remat_policy == "save_qkv_proj":
         policy = jax.checkpoint_policies.save_only_these_names(
             "query_proj",
             "value_proj",
@@ -1330,7 +1368,7 @@ class NNXDecoder(nnx.Module):
             "kv_proj",
             "qkv_proj",
         )
-      elif cfg.remat_policy == "qkv_proj_offloaded":
+      elif remat_policy == "qkv_proj_offloaded":
         policy = jax.checkpoint_policies.save_and_offload_only_these_names(
             names_which_can_be_saved=[],
             names_which_can_be_offloaded=[
@@ -1342,7 +1380,7 @@ class NNXDecoder(nnx.Module):
             offload_src="device",
             offload_dst="pinned_host",
         )
-      elif cfg.remat_policy == "minimal_offloaded":
+      elif remat_policy == "minimal_offloaded":
         policy = jax.checkpoint_policies.save_and_offload_only_these_names(
             names_which_can_be_saved=[],
             names_which_can_be_offloaded=[
@@ -1360,17 +1398,17 @@ class NNXDecoder(nnx.Module):
             offload_src="device",
             offload_dst="pinned_host",
         )
-      elif cfg.remat_policy == "custom":
+      elif remat_policy == "custom":
         policy = jax.checkpoint_policies.save_and_offload_only_these_names(
             names_which_can_be_saved=cfg.tensors_on_device,
             names_which_can_be_offloaded=cfg.tensors_to_offload,
             offload_src="device",
             offload_dst="pinned_host",
         )
-      elif cfg.remat_policy == "save_out_proj":
+      elif remat_policy == "save_out_proj":
         policy = jax.checkpoint_policies.save_only_these_names("out_proj")
       else:
-        assert cfg.remat_policy == "full", "Remat policy needs to be on list of remat policies"
+        assert remat_policy == "full", "Remat policy needs to be on list of remat policies"
         policy = None
     return policy
 
@@ -1480,6 +1518,7 @@ class NNXDecoder(nnx.Module):
             "qwen3.5-397b-a17b",
             "maxtext-omni-gemma3-qwen3",
             "cosmos3-nano-reasoner",
+            "cosmos3-super-reasoner",
         }:
           y = mm_utils.merge_mm_embeddings(
               text_embeddings=y,
@@ -1499,6 +1538,7 @@ class NNXDecoder(nnx.Module):
             "qwen3.5-35b-a3b",
             "qwen3.5-397b-a17b",
             "cosmos3-nano-reasoner",
+            "cosmos3-super-reasoner",
         }:
           y = mm_utils.merge_mm_embeddings(
               text_embeddings=y,
@@ -1531,19 +1571,31 @@ class NNXDecoder(nnx.Module):
 
     return y
 
-  def apply_output_head(self, shared_embedding, y, deterministic, model_mode):
-    """Applies final normalization and projects hidden states to logits."""
+  def apply_output_head(self, shared_embedding, y, deterministic, model_mode, normalize_y=True):
+    """Applies final normalization and projects hidden states to logits.
+
+    Args:
+      shared_embedding: Shared token embedding layer for tied logit projection.
+      y: Input hidden state tensor to project to logits.
+      deterministic: Whether dropout is disabled.
+      model_mode: Operational mode (e.g. MODEL_MODE_TRAIN, MODEL_MODE_PREFILL).
+      normalize_y: If True (default), applies the main decoder final normalization
+        (decoder_norm) before projecting to logits. Set to False when called from
+        Multi-Token Prediction (MTP), which applies its own dedicated final norm
+        (mtp_k_final_norm) to avoid double normalization.
+    """
 
     cfg = self.config
-    if cfg.shard_mode == ShardMode.EXPLICIT:
-      norm_out_sharding = create_sharding(
-          self.mesh,
-          ("activation_batch", "activation_length", "activation_embed"),
-      )
-    else:
-      norm_out_sharding = None
+    if normalize_y:
+      if cfg.shard_mode == ShardMode.EXPLICIT:
+        norm_out_sharding = create_sharding(
+            self.mesh,
+            ("activation_batch", "activation_length", "activation_embed"),
+        )
+      else:
+        norm_out_sharding = None
 
-    y = self.decoder_norm(y, out_sharding=norm_out_sharding)
+      y = self.decoder_norm(y, out_sharding=norm_out_sharding)
     y = self.dropout(y, deterministic=deterministic)  # NNX call
 
     if model_mode in {MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE}:
@@ -2722,25 +2774,3 @@ class NNXDecoder(nnx.Module):
           _add(m)
 
     return layers
-
-
-def decoder_as_linen(
-    config: Config,
-    mesh: Mesh,
-    rngs: nnx.Rngs,
-    model_mode: str,
-    quant: None | Quant = None,
-):
-  """Creates a Decoder module"""
-  module = nnx_wrappers.to_linen(
-      NNXDecoder,
-      config=config,
-      mesh=mesh,
-      model_mode=model_mode,
-      rngs=rngs,
-      quant=quant,
-      name="decoder",
-      abstract_init=False,
-      metadata_fn=initializers.variable_to_logically_partitioned,
-  )
-  return module
