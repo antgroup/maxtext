@@ -33,7 +33,7 @@ pyzmq
 ray
 setproctitle>=1.0
 setuptools==78.1.0
-torch==2.11.0
+torch==2.13.0
 watchfiles
 xgrammar
 xprof
